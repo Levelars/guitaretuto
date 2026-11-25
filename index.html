@@ -825,6 +825,18 @@ html.standalone .ia-fab{bottom:calc(30px + var(--kb,0px))}
 .ia-head .ia-x{font-size:.9rem;opacity:.75}
 .ia-head .ia-x:hover{opacity:1}
 .ia-acts .btn.ghost{background:transparent;color:var(--bone);border:1px solid #5A4130;box-shadow:none}
+#mic-garde{position:fixed;left:0;right:0;bottom:0;z-index:2147483000;
+  display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap;justify-content:center;
+  background:#B3261E;color:#fff;padding:9px 14px calc(9px + env(safe-area-inset-bottom));box-shadow:0 -6px 24px rgba(0,0,0,.55);
+  font:600 .9rem/1.25 system-ui,sans-serif;text-align:center}
+.mic-ouvert body{padding-bottom:76px}
+.mic-ouvert .ia-fab,.mic-ouvert .ia{bottom:84px}
+.mic-ouvert .toast{bottom:92px}
+#mic-garde[hidden]{display:none}
+#mic-garde .mg-pt{width:10px;height:10px;border-radius:50%;background:#fff;animation:mgpulse 1s infinite}
+#mic-garde button{background:#fff;color:#B3261E;border:0;border-radius:999px;padding:8px 14px;font:700 .9rem system-ui,sans-serif;cursor:pointer;min-height:36px}
+@keyframes mgpulse{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){#mic-garde .mg-pt{animation:none}}
 </style>
 </head>
 <body>
@@ -2308,6 +2320,8 @@ const VIEWS=[["accueil","Accueil"],["parcours","Parcours"],["atelier","Atelier"]
              ["techniques","Techniques"],["accords","Accords"],["playlists","Playlists"],["guitares","Guitares"],
              ["videos","Vidéos"],["prof","Espace prof"]];
 function go(v){
+  const cur=document.querySelector(".view.on");
+  if(!cur||cur.id!=="v-"+v){ if(typeof micCouperTout==="function") micCouperTout("Micro coupé : tu as changé de page"); }
   $$(".view").forEach(x=>x.classList.toggle("on",x.id==="v-"+v));
   $$(".tab").forEach(t=>t.setAttribute("aria-current",String(t.dataset.v===v)));
   window.scrollTo({top:0,behavior:"smooth"});
@@ -2936,9 +2950,151 @@ function detectPitch(raw,sr,hint){
   return {f:sr/lag, rms, clar:c.clar, lag};
 }
 
+/* ============================================================
+   GARDE DU MICRO
+   Règle absolue : le micro ne s'ouvre que sur un clic de l'élève,
+   ne sert qu'à l'outil qui l'a demandé, et se ferme tout seul dès
+   qu'on fait autre chose. Tous les flux passent par ce registre :
+   même un flux ouvert par erreur ailleurs dans le code est
+   rattrapé et coupé par la ronde de sécurité.
+     · bandeau rouge permanent tant qu'un micro est ouvert,
+       avec un bouton « Couper le micro » toujours visible ;
+     · coupure en changeant de page, en touchant un autre outil,
+       en quittant l'onglet, avec la touche Échap ;
+     · coupure automatique au bout de 5 minutes ;
+     · contexte audio séparé pour l'écoute : il est détruit à la
+       coupure, le son des accords n'est jamais relié au micro ;
+     · aucune ouverture sans geste de l'élève.
+   ============================================================ */
+var MICS=new Set(), micDepuis=0, micRonde=null, MIC_CTX=null;
+var MIC_MAX_MS=5*60*1000;
+var micProprio="";                              /* "tuner", "test" ou "ech" */
+function micVivant(s){ try{ return s.getTracks().some(t=>t.readyState==="live"); }catch(_){ return false; } }
+function micActif(){ for(const s of MICS) if(micVivant(s)) return true; return false; }
+function micInscrire(stream){
+  if(!stream||MICS.has(stream)) return stream;
+  MICS.add(stream);
+  try{ stream.getTracks().forEach(t=>t.addEventListener("ended",micNettoyer)); }catch(_){}
+  if(!micDepuis) micDepuis=Date.now();
+  if(!micRonde) micRonde=setInterval(micVeille,1000);
+  micBandeau();
+  return stream;
+}
+function micLiberer(stream){
+  if(!stream) return;
+  try{ stream.getTracks().forEach(t=>{ try{ t.enabled=false; }catch(_){} try{ t.stop(); }catch(_){} }); }catch(_){}
+  MICS.delete(stream);
+  micNettoyer();
+}
+function micNettoyer(){
+  for(const s of [...MICS]) if(!micVivant(s)) MICS.delete(s);
+  if(!MICS.size){
+    micDepuis=0; micProprio="";
+    if(micRonde){ clearInterval(micRonde); micRonde=null; }
+    micFermerCtx();
+  }
+  micBandeau();
+}
+/* contexte audio réservé à l'écoute : jamais relié aux enceintes */
+function micCtx(){
+  const C=window.AudioContext||window.webkitAudioContext;
+  if(!C) return null;
+  if(!MIC_CTX||MIC_CTX.state==="closed") MIC_CTX=new C();
+  return MIC_CTX;
+}
+function micCtxPret(){
+  const c=micCtx(); if(c&&c.state==="suspended"){ try{ c.resume(); }catch(_){} }
+}
+function micFermerCtx(){
+  const c=MIC_CTX; MIC_CTX=null;
+  if(c&&c.state!=="closed"){ try{ c.close(); }catch(_){} }
+}
+/* LA fonction d'arrêt : coupe tout, quel que soit l'outil */
+function micCouperTout(raison){
+  const etaitActif=micActif()||(typeof micOn!=="undefined"&&micOn)||(typeof echEnCours!=="undefined"&&echEnCours>=0);
+  if(typeof micOn!=="undefined"&&micOn){ try{ micStop(); }catch(_){} }
+  if(typeof echMedia!=="undefined"&&echMedia&&echMedia.state==="recording"){ try{ echMedia.stop(); }catch(_){} }
+  if(typeof echFlux!=="undefined"&&echFlux){ micLiberer(echFlux); echFlux=null; }
+  for(const s of [...MICS]) micLiberer(s);
+  MICS.clear(); micNettoyer(); micFermerCtx();
+  if(etaitActif&&raison&&typeof toast==="function") toast(raison);
+}
+/* ronde de sécurité, chaque seconde tant qu'un micro est ouvert */
+function micVeille(){
+  micNettoyer();
+  if(!MICS.size) return;
+  if(Date.now()-micDepuis>MIC_MAX_MS) return micCouperTout("Micro coupé automatiquement après 5 minutes");
+  /* un flux que plus aucun outil n'utilise : on le ferme */
+  const tunerOn=(typeof micOn!=="undefined"&&micOn), echOn=(typeof echEnCours!=="undefined"&&echEnCours>=0);
+  const testOn=(typeof testing!=="undefined"&&testing);
+  const demarrage=(micProprio==="tuner"&&!micStream&&Date.now()-micDepuis<15000);
+  if(!tunerOn&&!echOn&&!testOn&&!demarrage) return micCouperTout("Micro coupé : plus aucun outil ne l'utilisait");
+  if(document.hidden) return micCouperTout();
+}
+/* bandeau toujours visible tant que le micro est ouvert */
+function micBandeau(){
+  let b=document.getElementById("mic-garde");
+  const on=MICS.size>0&&micActif();
+  if(!on){ if(b) b.hidden=true; document.documentElement.classList.remove("mic-ouvert"); return; }
+  if(!b){
+    b=document.createElement("div"); b.id="mic-garde"; b.setAttribute("role","status"); b.setAttribute("aria-live","polite");
+    b.innerHTML='<span class="mg-pt" aria-hidden="true"></span><span class="mg-txt">Micro ouvert</span>'+
+      '<button type="button" id="mic-garde-stop">Couper le micro</button>';
+    document.body.appendChild(b);
+    b.querySelector("#mic-garde-stop").addEventListener("click",ev=>{
+      ev.preventDefault(); ev.stopPropagation(); micCouperTout("Micro coupé");
+    });
+  }
+  b.hidden=false; document.documentElement.classList.add("mic-ouvert");
+  const sec=Math.floor((Date.now()-micDepuis)/1000), rest=Math.max(0,Math.ceil((MIC_MAX_MS-(Date.now()-micDepuis))/1000));
+  const fmt=n=>Math.floor(n/60)+":"+String(n%60).padStart(2,"0");
+  const qui=micProprio==="ech"?"enregistrement de ta guitare":micProprio==="test"?"test du micro":"accordeur";
+  b.querySelector(".mg-txt").textContent="Micro ouvert ("+qui+") · "+fmt(sec)+" · coupure auto dans "+fmt(rest);
+}
+/* filet : tout getUserMedia du site passe par le registre,
+   et aucun n'est accepté sans geste récent de l'élève */
+(function(){
+  const md=navigator.mediaDevices;
+  if(!md||typeof md.getUserMedia!=="function"||md.__garde) return;
+  const orig=md.getUserMedia.bind(md);
+  md.getUserMedia=function(c){
+    if(navigator.userActivation&&!navigator.userActivation.isActive&&!navigator.userActivation.hasBeenActive){
+      const e=new Error("Le micro ne s'ouvre que sur un clic"); e.name="NotAllowedError"; return Promise.reject(e);
+    }
+    return orig(c).then(st=>{
+      /* l'outil a pu être abandonné pendant la demande d'autorisation */
+      if(!micProprio){ micLiberer(st); const e=new Error("annulé"); e.name="AbortError"; throw e; }
+      return micInscrire(st);
+    });
+  };
+  try{ Object.defineProperty(md,"__garde",{value:true}); }catch(_){ md.__garde=true; }
+})();
+/* toutes les sorties possibles coupent le micro */
+document.addEventListener("visibilitychange",()=>{ if(document.hidden) micCouperTout(); });
+window.addEventListener("pagehide",()=>micCouperTout());
+window.addEventListener("beforeunload",()=>micCouperTout());
+document.addEventListener("freeze",()=>micCouperTout());
+document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&MICS.size) micCouperTout("Micro coupé"); });
+/* toucher un autre outil que celui qui écoute coupe le micro */
+document.addEventListener("click",e=>{
+  if(!MICS.size&&!micProprio) return;
+  const t=e.target.closest&&e.target.closest("button,a,input,select,textarea,label,[data-go],[data-v],[data-m],[data-ech],[role=button],.card,.strbtn");
+  if(!t||t.closest("#mic-garde")) return;
+  const zone=t.closest("[data-mic-zone]");
+  const z=zone?zone.dataset.micZone:"";
+  const voulu=(micProprio==="ech")?"ech":"tuner";
+  if(z!==voulu) micCouperTout("Micro coupé : tu es passé à un autre outil");
+},true);
+/* un appel, une visio ou le système qui reprend le micro : on coupe */
+if(navigator.mediaDevices&&navigator.mediaDevices.addEventListener){
+  navigator.mediaDevices.addEventListener("devicechange",()=>{
+    for(const s of MICS) if(!micVivant(s)) micCouperTout("Micro coupé : l'entrée audio a changé");
+  });
+}
+
 let micStream=null, micAn=null, micBuf=null, micOn=false, micRAF=null, readBuf=null,
     micPause=0, micLast=0, hist=[], shownCents=0, lastGood=0, trackLag=0,
-    micSR=0, micWatchdog=null, devWatch=false, lowSince=0, peakLv=0;
+    micSR=0, micWatchdog=null, devWatch=false, lowSince=0, peakLv=0, micNodes=[];
 
 function envState(){
   const secure = (typeof window.isSecureContext==="boolean")
@@ -2987,7 +3143,7 @@ function gum(constraints){
     return navigator.mediaDevices.getUserMedia(constraints);
   const old=navigator.getUserMedia||navigator.webkitGetUserMedia||navigator.mozGetUserMedia;
   if(!old){ const e=new Error("indisponible"); e.name="NotSupportedError"; return Promise.reject(e); }
-  return new Promise((ok,ko)=>old.call(navigator,constraints,ok,ko));
+  return new Promise((ok,ko)=>old.call(navigator,constraints,ok,ko)).then(micInscrire);
 }
 async function permState(){
   try{
@@ -3000,10 +3156,12 @@ async function watchPerm(){
   if(permWatched) return;
   const p=await permState(); if(!p) return;
   permWatched=true;
-  /* si l'élève corrige l'autorisation dans les réglages, l'accordeur démarre seul */
+  /* on suit l'autorisation, sans jamais ouvrir le micro à la place de l'élève */
+  /* le micro ne démarre JAMAIS tout seul : seulement sur un clic.
+     Si l'autorisation est retirée, on coupe tout immédiatement. */
   p.onchange=()=>{
-    if(p.state==="granted"&&!micOn) micStart();
-    else if(p.state==="denied"&&micOn) micStop();
+    if(p.state!=="granted") micCouperTout("Autorisation du micro retirée : micro coupé");
+    else $("#mic-status").textContent="Micro autorisé — appuie sur « Activer le micro »";
   };
 }
 function policyAllows(){
@@ -3023,6 +3181,7 @@ function actBtns(list){
     '<button class="btn '+(cls||"ghost")+' sm" data-act="'+a+'">'+l+'</button>').join("")+'</div>';
 }
 function micFail(kind){
+  if(!micOn&&micProprio!=="test"){ micCouperTout(); }   /* un échec ne laisse jamais rien d'ouvert */
   const e=envState();
   /* garde-fou : « autorisation refusée » n'est affiché que si un réglage
      peut réellement débloquer. Sinon on annonce la vraie cause. */
@@ -3098,6 +3257,9 @@ $("#mic-help").addEventListener("click",e=>{
 
 async function micStart(){
   if(micOn) micStop();
+  micCouperTout();                                  /* un seul micro à la fois, jamais deux outils */
+  micProprio="tuner";
+  micCtxPret();                                     /* créé pendant le clic : iOS l'exige */
   if(typeof droneStop==="function") droneStop();   /* sinon le micro s'entend lui-même */
   if(typeof metOn!=="undefined"&&metOn) metStop();  /* le clic du métronome serait pris pour une note */
   const e=envState();
@@ -3121,6 +3283,7 @@ async function micStart(){
 
   $("#mic-status").textContent="Autorisation demandée…";
   $("#mic-btn").textContent="En attente…";
+  micProprio="tuner";
 
   /* certains téléphones refusent les réglages fins : on redescend en gamme */
   let stream=null, err=null;
@@ -3132,7 +3295,12 @@ async function micStart(){
       if(n==="NotAllowedError"||n==="SecurityError"||n==="PermissionDeniedError"||n==="NotFoundError") break;
     }
   }
+  /* l'élève a changé d'outil pendant la demande : on ne garde rien */
+  if(stream&&micProprio!=="tuner"){ micLiberer(stream); stream=null; return micStop(); }
   if(!stream){
+    const abandon=(micProprio!=="tuner");
+    micProprio="";
+    if(abandon){ micFermerCtx(); return micStop(); }
     const n=err&&err.name;
     if(n==="NotAllowedError"||n==="SecurityError"||n==="PermissionDeniedError") return micFail(e.framed?"framed":"denied");
     if(n==="NotFoundError"||n==="DevicesNotFoundError") return micFail("nodevice");
@@ -3142,8 +3310,9 @@ async function micStart(){
   }
 
   try{
-    const c=ac();
-    if(c.state==="suspended"){ try{ await c.resume(); }catch(_){} }
+    micInscrire(stream);
+    const c=micCtx();                               /* contexte à part : rien ne sort vers les enceintes */
+    if(c.state==="suspended"){ try{ await Promise.race([c.resume(),new Promise(r=>setTimeout(r,400))]); }catch(_){} }
     micStream=stream;
     const src=c.createMediaStreamSource(stream);
     const hp=c.createBiquadFilter(); hp.type="highpass"; hp.frequency.value=55; hp.Q.value=.7;
@@ -3151,6 +3320,7 @@ async function micStart(){
     micAn=c.createAnalyser(); micAn.fftSize=pickFFT(c.sampleRate); micAn.smoothingTimeConstant=0;
     micSR=c.sampleRate;
     src.connect(hp); hp.connect(lp); lp.connect(micAn);   /* jamais vers les enceintes : pas de larsen */
+    micNodes=[src,hp,lp,micAn];
     micBuf=new Float32Array(micAn.fftSize);
     /* Safari < 14.1 ne connaît pas getFloatTimeDomainData */
     if(micAn.getFloatTimeDomainData){ readBuf=()=>micAn.getFloatTimeDomainData(micBuf); }
@@ -3178,10 +3348,10 @@ async function micStart(){
     $("#mic-btn").classList.add("ghost");
     $("#mic-status").textContent="À l'écoute";
     $("#m-msg").textContent="Joue une corde";
-    renderDiag('<div class="note good"><b>Micro actif</b>Joue une seule corde à la fois et laisse-la sonner. Le son ne quitte pas ton appareil : rien n\'est enregistré ni envoyé. Sur iPhone, les notes de référence deviennent plus faibles tant que le micro est ouvert : c\'est normal, branche un casque ou coupe le micro.</div>');
+    renderDiag('<div class="note good"><b>Micro actif</b>Joue une seule corde à la fois et laisse-la sonner. Le son ne quitte pas ton appareil : rien n\'est enregistré ni envoyé, et le micro n\'est jamais relié aux haut-parleurs. Il se coupe tout seul dès que tu changes d\'outil ou de page, que tu quittes l\'onglet, que tu appuies sur Échap, ou au bout de 5 minutes. Sur iPhone, les notes de référence sont plus faibles tant que le micro est ouvert : le volume revient dès qu\'il est coupé.</div>');
     micLoop();
   }catch(ex){
-    try{ stream.getTracks().forEach(t=>t.stop()); }catch(_){}
+    micLiberer(stream); micStream=null; micOn=false;
     micFail("unknown");
   }
 }
@@ -3189,7 +3359,9 @@ function micStop(){
   micOn=false; trackLag=0; hist=[]; micSR=0; peakLv=0; lowSince=0;
   if(micWatchdog){ clearInterval(micWatchdog); micWatchdog=null; }
   if(micRAF) cancelAnimationFrame(micRAF); micRAF=null;
-  if(micStream){ micStream.getTracks().forEach(t=>t.stop()); micStream=null; }
+  micNodes.forEach(n=>{ try{ n.disconnect(); }catch(_){} }); micNodes=[];
+  if(micStream){ micLiberer(micStream); micStream=null; }
+  if(micProprio==="tuner"&&!micActif()) micProprio="";
   micAn=null; readBuf=null;
   const b=$("#mic-btn"); if(b){ b.textContent="Activer le micro"; b.classList.remove("ghost"); }
   $("#mic-status").textContent="";
@@ -3210,11 +3382,12 @@ function needle(cents,ok){
 }
 function guardMic(){
   if(!micOn){ clearInterval(micWatchdog); micWatchdog=null; return; }
-  const c=ac();
-  /* l'onglet est repassé au premier plan, ou iOS a suspendu le son */
-  if(c&&c.state!=="running"){ try{ c.resume(); }catch(e){} }
-  /* la fréquence d'échantillonnage a changé (casque branché en cours de route) */
-  if(c&&micSR&&Math.abs(c.sampleRate-micSR)>1){ const t=TUN; micStop(); micStart(); return; }
+  const c=MIC_CTX;
+  if(!c||c.state==="closed"||!micStream||!micVivant(micStream)){ micStop(); return; }
+  if(c.state!=="running"){ try{ c.resume(); }catch(e){} }
+  /* la fréquence d'échantillonnage a changé (casque branché en cours de route) :
+     on coupe et on prévient, on ne rouvre jamais le micro sans clic */
+  if(micSR&&Math.abs(c.sampleRate-micSR)>1){ micStop(); toast("Entrée audio changée : réactive le micro"); return; }
   /* la boucle d'analyse s'est arrêtée : on la relance */
   if(performance.now()-micLast>2500){ micLast=performance.now(); if(micRAF) cancelAnimationFrame(micRAF); micLoop(); }
 }
@@ -3482,7 +3655,7 @@ async function listDevices(){
 }
 if($("#mic-src")) $("#mic-src").onchange=e=>{
   micDevice=e.target.value;
-  if(micOn){ micStop(); micStart(); }
+  if(micOn){ micStart(); }                          /* geste de l'élève : on rouvre sur la nouvelle entrée */
   else toast("Entrée changée — active le micro");
 };
 
@@ -3496,12 +3669,17 @@ async function micTest(){
   if(micOn) micStop();
   droneStop();
   if(typeof metOn!=="undefined"&&metOn) metStop();
+  micCouperTout(); micProprio="test"; micCtxPret();
   const btn=$("#mic-test"); btn.textContent="Test en cours…";
   try{ await micTestInterne(btn); }
   catch(err){
     testing=false; btn.textContent="Tester le micro";
     renderDiag('<div class="alert"><h4>Le test s\'est interrompu</h4><p>Relance-le. Si ça se reproduit, recharge la page — l\'accordeur à l\'oreille reste utilisable dans tous les cas.</p>'+
       actBtns([["test","Relancer le test","brass"],["ear","Passer à l\'accordeur à l\'oreille"]])+'</div>');
+  }
+  finally{
+    testing=false; btn.textContent="Tester le micro";
+    if(micProprio==="test"){ micCouperTout(); }   /* le test ne laisse jamais le micro ouvert */
   }
 }
 async function micTestInterne(btn){
@@ -3593,8 +3771,9 @@ async function micTestInterne(btn){
   await listDevices();
 
   s=step("Son reçu (parle ou joue une corde)");
-  const c=ac();
-  if(c.state==="suspended"){ try{ await c.resume(); }catch(_){} }
+  micInscrire(stream);
+  const c=micCtx();
+  if(c.state==="suspended"){ try{ await Promise.race([c.resume(),new Promise(r=>setTimeout(r,400))]); }catch(_){} }
   const src=c.createMediaStreamSource(stream), an=c.createAnalyser();
   an.fftSize=2048; src.connect(an);
   const buf=new Float32Array(an.fftSize);
@@ -3613,11 +3792,11 @@ async function micTestInterne(btn){
       $("#mic-lvlbar").classList.toggle("hot",peak>.22);
       s.val=Math.round(pc)+" %";
       draw();
-      if(performance.now()-t0<4000) requestAnimationFrame(tick); else res();
+      if(performance.now()-t0<4000&&micProprio==="test"&&micVivant(stream)) requestAnimationFrame(tick); else res();
     })();
   });
   try{ src.disconnect(); an.disconnect(); }catch(_){}
-  stream.getTracks().forEach(t=>t.stop());
+  micLiberer(stream);
   $("#mic-lvl").style.width="0%"; $("#mic-lvlbar").classList.remove("hot");
   if(peak<.004){
     s.state="ko"; s.val="silence";
@@ -5128,10 +5307,14 @@ async function echEnregistrer(i){
   const e=envState();
   if(!e.secure||!e.api){ st.textContent="Le micro n'est pas disponible sur cette adresse."; return; }
   if(typeof MediaRecorder==="undefined"){ st.textContent="Ce navigateur ne sait pas enregistrer. Essaie Chrome ou un Safari récent."; return; }
+  micCouperTout();                                 /* l'accordeur ne doit pas écouter en même temps */
+  micProprio="ech";
   echEnCours=i; echRender();
   try{
-    if(!echFlux) echFlux=await gum({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-  }catch(ex){ st.textContent="Micro refusé. Autorise-le puis réessaie."; echEnCours=-1; echRender(); return; }
+    echFlux=await gum({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    micInscrire(echFlux);
+  }catch(ex){ st.textContent="Micro refusé. Autorise-le puis réessaie."; echEnCours=-1; micProprio=""; echRender(); return; }
+  const fermer=()=>{ if(echFlux){ micLiberer(echFlux); echFlux=null; } if(micProprio==="ech") micProprio=""; };
 
   const c=ac();
   st.textContent="Prépare-toi…";
@@ -5139,14 +5322,17 @@ async function echEnregistrer(i){
   st.innerHTML='<b style="color:var(--oxblood)">● Joue la corde maintenant</b>';
 
   let morceaux=[];
+  if(micProprio!=="ech"||!echFlux){ fermer(); echEnCours=-1; echRender(); st.textContent="Enregistrement annulé."; return; }
   try{ echMedia=new MediaRecorder(echFlux); }
-  catch(ex){ st.textContent="Enregistrement impossible sur cet appareil."; echEnCours=-1; echRender(); return; }
+  catch(ex){ fermer(); st.textContent="Enregistrement impossible sur cet appareil."; echEnCours=-1; echRender(); return; }
   echMedia.ondataavailable=ev=>{ if(ev.data&&ev.data.size) morceaux.push(ev.data); };
   const fini=new Promise(r=>{ echMedia.onstop=r; });
   echMedia.start();
-  await new Promise(r=>setTimeout(r,2600));
-  try{ echMedia.stop(); }catch(ex){}
+  await new Promise(r=>{ const t0=Date.now(); const iv=setInterval(()=>{
+    if(Date.now()-t0>=2600||echMedia.state!=="recording"){ clearInterval(iv); r(); } },100); });
+  try{ if(echMedia.state==="recording") echMedia.stop(); }catch(ex){}
   await fini;
+  fermer();                                         /* micro rendu immédiatement, pas à la fermeture de la page */
 
   st.textContent="Analyse…";
   try{
@@ -5199,7 +5385,7 @@ function echNettoyer(c,brut){
 
 function echEffacer(){
   ECH=null;
-  if(echFlux){ echFlux.getTracks().forEach(t=>t.stop()); echFlux=null; }
+  if(echFlux){ micLiberer(echFlux); echFlux=null; }
   $("#ech-state").textContent="Échantillons effacés — le modèle physique reprend la main.";
   echRender();
 }
@@ -5225,6 +5411,11 @@ $("#ech-strings").addEventListener("click",e=>{
 });
 $("#ech-clear").onclick=echEffacer;
 echRender();
+/* zones où le micro a le droit de rester ouvert */
+(function(){
+  const t=$("#pane-mic"); if(t&&t.closest(".tool")) t.closest(".tool").dataset.micZone="tuner";
+  const e=$("#ech-strings"); if(e&&e.closest(".tool")) e.closest(".tool").dataset.micZone="ech";
+})();
 </script>
 </body>
 </html>
